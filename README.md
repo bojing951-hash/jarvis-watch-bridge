@@ -1,25 +1,53 @@
-# Jarvis Watch Bridge v0.1
+# Jarvis Watch Bridge v0.2
 
-Apple Watch / iPhone 快捷指令 → 本机 AI 问答桥接服务。
+Apple Watch / iPhone 快捷指令 → 本机 AI 问答 + 个人记忆桥接服务。
 
 ```text
 Apple Watch 快捷指令(听写) → iPhone/互联网 → Cloudflare Quick Tunnel
-  → 本服务(127.0.0.1:8765, X-Jarvis-Key认证) → GLM通用API(demo/glm)
-  → 返回 {"reply":"..."} → 快捷指令朗读 → AirPods
+  → 本服务(127.0.0.1:8765, X-Jarvis-Key认证)
+       ├─ general_question → GLM通用API(demo/glm)
+       └─ memory_search / memory_create / memory_summary → Voicenotes MCP
+  → 返回 {"reply":"...","intent":"..."} → 快捷指令朗读 → AirPods
 ```
 
-个人记忆系统不在本项目范围内（由 Apple Watch + Voicenotes 承担）。
+## v0.2 新增
+
+- **意图路由**（`router.py`）：一句话自动分流普通问答 / 记忆查询 / 创建记录 / 日期总结；创建指令不明确时先确认，避免错误写入
+- **Voicenotes 个人记忆**（`voicenotes_client.py`）：官方 MCP（Streamable HTTP + Bearer），
+  支持 `search_notes` / `list_notes`（日期范围）/ `create_text_note`；工具参数 schema 在连接时自适应
+- **OAuth 一键授权**（`voicenotes_oauth.py`）：浏览器授权，令牌自动写入本地 `.env`，不上传仓库
+- **隐私加固**：服务端日志不再记录问题正文；错误信息不回显内部地址/密钥
+- **可靠性**：输入长度限制（500字，超出400）、统一错误响应、`GET /metrics` 指标
+  （请求数/成功率/平均与P95延迟/意图分布/模型调用统计，需 X-Jarvis-Key）
+- **glm_provider**：空 `content` 一律报错，绝不朗读 `reasoning_content` 推理过程
+- Voicenotes 不可用或未授权时诚实降级，普通问答不受影响
+
+## 启用个人记忆（一次）
+
+```bash
+cd /Users/cast/AI内容/贾维斯/JarvisWatchBridge
+python3 voicenotes_oauth.py   # 浏览器登录 Voicenotes 并允许
+./start_jarvis.sh restart     # 重启生效 (隧道地址会变, 更新快捷指令)
+```
+
+## 个人记忆历史
+
+v0.1：初始问答桥（`/health` `/ask`、GLM demo/glm 双模式、Quick Tunnel、一键脚本）。
+记忆系统此前由 Apple Watch + Voicenotes App 承担，v0.2 起由本服务经官方 MCP 直连。
 
 ## 文件结构
 
 | 文件 | 作用 |
 |---|---|
-| `server.py` | HTTP 服务：`GET /health`、`POST /ask`（X-Jarvis-Key 认证，仅监听 127.0.0.1） |
+| `server.py` | HTTP 服务：`GET /health`、`GET /metrics`、`POST /ask`（X-Jarvis-Key 认证，仅监听 127.0.0.1） |
+| `router.py` | 意图路由（general_question / memory_search / memory_create / memory_summary） |
 | `glm_provider.py` | GLM 通用 API 调用（OpenAI 兼容接口，直连不走系统代理） |
+| `voicenotes_client.py` | Voicenotes 官方 MCP 客户端（检索/日期列表/创建笔记） |
+| `voicenotes_oauth.py` | Voicenotes 浏览器 OAuth 一键授权（令牌写入本地 .env） |
 | `demo_provider.py` | 无密钥时的演示应答（不编造知识性答案） |
 | `setup.py` | 初始化：生成 `.env` 与随机 `JARVIS_TOKEN`（不覆盖已有配置） |
 | `start_jarvis.sh` | 一键 `start / stop / status / restart`（含防重复启动、健康检查、公网验证） |
-| `tests/` | 自动化测试：`./run_tests.sh`（16 项；配了 GLM 密钥后含真实模型调用） |
+| `tests/` | 自动化测试：`./run_tests.sh`（41 项；配了 GLM 密钥后含真实模型调用） |
 | `IPHONE_SHORTCUT_SETUP.md` | iPhone/Watch 快捷指令最终配置说明 |
 
 ## 日常使用
