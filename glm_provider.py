@@ -26,15 +26,19 @@ class ProviderError(Exception):
     """带用户可读中文信息的模型调用失败."""
 
 
-def answer(question, api_key, model, base_url, timeout=45):
-    """调用 GLM chat/completions, 返回纯文本回答. 失败抛 ProviderError."""
+def answer(question, api_key, model, base_url, timeout=45, system=None):
+    """调用 GLM chat/completions, 返回纯文本回答. 失败抛 ProviderError.
+
+    v0.2: system 可覆盖 (记忆问答用更严格的不编造提示);
+    不再读取 reasoning_content — 推理过程不是给用户朗读的答案.
+    """
     if not api_key:
         raise ProviderError("未配置 GLM_API_KEY")
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system or SYSTEM_PROMPT},
             {"role": "user", "content": question},
         ],
         "temperature": 0.3,
@@ -66,19 +70,17 @@ def answer(question, api_key, model, base_url, timeout=45):
         reason = getattr(e, "reason", e)
         if isinstance(reason, socket.timeout):
             raise ProviderError("GLM响应超时，可稍后重试")
-        raise ProviderError("无法连接GLM接口: %s" % reason)
+        # 错误信息只描述类别, 不回显内部地址等配置
+        raise ProviderError("无法连接GLM服务（网络异常）")
     except json.JSONDecodeError:
         raise ProviderError("GLM返回了无法解析的内容")
 
     try:
         message = data["choices"][0]["message"]
         reply = (message.get("content") or "").strip()
-        if not reply:
-            # 部分推理模型可能把结论放在 reasoning_content, 取末段兜底
-            rc = (message.get("reasoning_content") or "").strip()
-            reply = rc.splitlines()[-1].strip() if rc else ""
     except (KeyError, IndexError, AttributeError):
         raise ProviderError("GLM返回格式异常，无法提取回答")
     if not reply:
+        # v0.2: 空 content 一律视为失败, 不朗读 reasoning_content
         raise ProviderError("GLM返回了空回答")
     return reply

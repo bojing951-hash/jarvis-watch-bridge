@@ -78,11 +78,12 @@ class TestGlmProviderPayload(unittest.TestCase):
         reply = glm_provider.answer("q", "k", "m", "https://example/v4", 5)
         self.assertEqual(reply, "逆回购是美联储卖出国债回收流动性。")
 
-    def test_empty_content_falls_back_to_reasoning_tail(self):
+    def test_reasoning_only_response_is_rejected(self):
+        """v0.2: content为空时必须报错, 不得把推理过程当答案朗读."""
         class FakeResponse2:
             def read(self):
                 return ('{"choices":[{"message":{"content":"",'
-                        '"reasoning_content":"思考过程...\\n结论：答案在这里"}}]}').encode("utf-8")
+                        '"reasoning_content":"推理过程不应被朗读"}}]}').encode("utf-8")
 
             def __enter__(self):
                 return self
@@ -91,14 +92,32 @@ class TestGlmProviderPayload(unittest.TestCase):
                 return False
 
         glm_provider.DIRECT_OPENER.open = lambda req, timeout=None: FakeResponse2()
-        reply = glm_provider.answer("q", "k", "m", "https://example/v4", 5)
-        self.assertEqual(reply, "结论：答案在这里")
+        with self.assertRaises(glm_provider.ProviderError):
+            glm_provider.answer("q", "k", "m", "https://example/v4", 5)
 
 
 class TestGlmProviderErrors(unittest.TestCase):
     def test_missing_key_raises_provider_error(self):
         with self.assertRaises(glm_provider.ProviderError):
             glm_provider.answer("q", "", "m", "https://example/v4", 5)
+
+    def test_network_error_message_has_no_internal_url(self):
+        """v0.2: 错误信息不得回显内部服务地址等配置."""
+        import urllib.error
+
+        def raise_url_error(req, timeout=None):
+            raise urllib.error.URLError("[Errno 60] connect to secret-glm.internal:443 failed")
+
+        real = glm_provider.DIRECT_OPENER.open
+        glm_provider.DIRECT_OPENER.open = raise_url_error
+        try:
+            with self.assertRaises(glm_provider.ProviderError) as ctx:
+                glm_provider.answer("q", "k", "m", "https://example/v4", 5)
+            msg = str(ctx.exception)
+            self.assertNotIn("secret-glm.internal", msg)
+            self.assertNotIn("http", msg)
+        finally:
+            glm_provider.DIRECT_OPENER.open = real
 
     def test_http_401_mapped_to_friendly_message(self):
         import urllib.error

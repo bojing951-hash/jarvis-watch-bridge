@@ -6,7 +6,7 @@
 ## 当前有效地址
 
 ```
-https://enters-post-patients-dale.trycloudflare.com/ask
+https://extends-produces-yesterday-requires.trycloudflare.com/ask
 ```
 
 ⚠️ **重要：Quick Tunnel 是临时地址，电脑端每次重启 Jarvis 后地址会变化。**
