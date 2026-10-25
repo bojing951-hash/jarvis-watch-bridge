@@ -32,9 +32,22 @@ class VoicenotesUnavailable(Exception):
     """Voicenotes 暂不可用或未授权 — 调用方需如实告知用户, 不得编造记忆."""
 
 
-def _next_day(date_iso):
-    from datetime import date, timedelta
-    return (date.fromisoformat(date_iso) + timedelta(days=1)).isoformat()
+def _day_bounds_utc(date_iso, tz=None):
+    """把本地日期转成 UTC 闭开区间 [当天00:00, 次日00:00) 的 ISO 串.
+
+    tz 缺省用系统本地时区(避免把 UTC 日期当本地日期导致边界偏移);
+    传入显式 tz 供单元测试.
+    """
+    from datetime import date, datetime, timedelta, timezone
+    d = date.fromisoformat(date_iso)
+    start_local = datetime(d.year, d.month, d.day)
+    if tz is None:
+        start_utc = start_local.astimezone(timezone.utc)  # naive→本地时区→UTC
+    else:
+        start_utc = start_local.replace(tzinfo=tz).astimezone(timezone.utc)
+    end_utc = start_utc + timedelta(days=1)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return start_utc.strftime(fmt), end_utc.strftime(fmt)
 
 
 def _pick(schema_props, candidates):
@@ -164,18 +177,18 @@ class VoicenotesClient:
     def list_notes(self, date_from=None, date_to=None):
         """按日期范围列出记录.
 
-        入参是本地日期(ISO); 若 schema 为合并式 date_range 数组, 转成
-        UTC 闭开区间 [当天00:00Z, 次日00:00Z], 保证覆盖整天.
-        (局限: 早上8点前录的记录会算进前一天, 对手表场景可接受)
+        入参是用户本地日期(ISO); schema 为合并式 date_range 数组时,
+        转成 UTC 闭开区间并按本地时区取整天边界, 避免跨时区漏记.
         """
         name = self._tool_name("list")
         props = self._tools.get(name, {})
         args = {}
         rk = _pick(props, _RANGE_KEYS)
         if date_from and rk:
-            start = date_from + "T00:00:00Z"
-            end_day = _next_day(date_to or date_from)
-            args[rk] = [start, end_day + "T00:00:00Z"]
+            start, _ = _day_bounds_utc(date_from)
+            # 结束边界: date_to 当天的次日零点(闭开区间覆盖整天)
+            _, end = _day_bounds_utc(date_to or date_from)
+            args[rk] = [start, end]
             return self._call("list", args)
         fk = _pick(props, _FROM_KEYS)
         tk = _pick(props, _TO_KEYS)

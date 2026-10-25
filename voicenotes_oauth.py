@@ -86,10 +86,19 @@ def register(meta):
 
 class _Waiter(BaseHTTPRequestHandler):
     code = None
+    expected_state = None
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+        state = (params.get("state") or [None])[0]
+        if _Waiter.expected_state and state != _Waiter.expected_state:
+            # state 不匹配: 可能是串扰回调, 拒绝接收授权码
+            self.send_response(400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("<h2>❌ state 校验失败, 请重跑授权工具</h2>".encode())
+            return
         _Waiter.code = (params.get("code") or [None])[0]
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -173,6 +182,10 @@ def save_token(token):
         lines.append(entry)
     with open(ENV_PATH, "w", encoding="utf-8") as f:
         f.writelines(lines)
+    try:
+        os.chmod(ENV_PATH, 0o600)  # 令牌所在文件仅本用户可读
+    except OSError:
+        pass
 
 
 def main():
@@ -196,6 +209,7 @@ def main():
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(
         hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    oauth_state = secrets.token_urlsafe(24)  # 防 CSRF: 回调必须原样带回
     scope = (meta.get("scopes_supported") or ["mcp:use"])[0]
     params = {
         "response_type": "code",
@@ -204,12 +218,14 @@ def main():
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "scope": scope,
+        "state": oauth_state,
     }
     if not client_id:
         params.pop("client_id")
     url = meta["authorization_endpoint"] + "?" + urllib.parse.urlencode(params)
     os.makedirs(os.path.join(BASE, ".run"), exist_ok=True)
     save_state(meta, client_id, verifier)
+    _Waiter.expected_state = oauth_state
     print("[oauth] 即将打开浏览器, 请登录 Voicenotes 并点击允许...")
     print("[oauth] 若浏览器未自动打开, 手动访问:\n" + url)
     webbrowser.open(url)

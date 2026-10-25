@@ -8,6 +8,7 @@
 """
 import json
 import socket
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -58,7 +59,7 @@ def _answer_once(question, api_key, model, base_url, timeout=45, system=None):
             {"role": "user", "content": question},
         ],
         "temperature": 0.3,
-        "max_tokens": 300,
+        "max_tokens": 600,
     }
     req = urllib.request.Request(
         url,
@@ -92,11 +93,15 @@ def _answer_once(question, api_key, model, base_url, timeout=45, system=None):
         raise ProviderError("GLM返回了无法解析的内容")
 
     try:
-        message = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        message = choice["message"]
         reply = (message.get("content") or "").strip()
     except (KeyError, IndexError, AttributeError):
         raise ProviderError("GLM返回格式异常，无法提取回答")
     if not reply:
         # v0.2: 空 content 一律视为失败, 不朗读 reasoning_content
         raise ProviderError("GLM返回了空回答")
+    if choice.get("finish_reason") == "length":
+        # 达到 token 上限被截断: 保留内容但记录, 供排查"朗读不完整"
+        sys.stderr.write("[glm] 回答被 max_tokens 截断(%d字)\n" % len(reply))
     return reply

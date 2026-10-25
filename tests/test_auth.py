@@ -104,14 +104,17 @@ class TestAPI(unittest.TestCase):
     def test_metrics_shape(self):
         code, body = self.request("/metrics", headers={"X-Jarvis-Key": TEST_TOKEN})
         self.assertEqual(code, 200)
-        for key in ("requests", "success_rate", "avg_latency_ms", "intents", "model_calls"):
+        for key in ("requests", "http_success_rate", "answer_success_rate",
+                    "answers_ok", "answers_degraded", "answers_failed",
+                    "avg_latency_ms", "intents", "model_calls",
+                    "search_calls", "mcp_calls"):
             self.assertIn(key, body)
 
     def test_health_reports_memory_and_version(self):
         code, body = self.request("/health")
         self.assertEqual(code, 200)
         self.assertIn(body["memory"], ("enabled", "disabled"))
-        self.assertEqual(body["version"], "0.2")
+        self.assertEqual(body["version"], "0.3")
 
     def test_logs_never_contain_question_text(self):
         """v0.2 隐私要求: 服务端日志不得出现问题正文."""
