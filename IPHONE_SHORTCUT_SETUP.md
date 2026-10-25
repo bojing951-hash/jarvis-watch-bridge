@@ -6,8 +6,10 @@
 ## 当前有效地址
 
 ```
-https://extends-produces-yesterday-requires.trycloudflare.com/ask
+https://links-query-suse-connecting.trycloudflare.com/ask
 ```
+
+（2026-10-25 最新；此地址在电脑端每次重启 Jarvis 后会变化，见下方说明）
 
 ⚠️ **重要：Quick Tunnel 是临时地址，电脑端每次重启 Jarvis 后地址会变化。**
 变化后在电脑上运行以下命令获取新地址，并更新快捷指令里的 URL：
@@ -34,7 +36,7 @@ grep JARVIS_TOKEN /Users/cast/AI内容/贾维斯/JarvisWatchBridge/.env
 
 ### 动作二：URL
 ```
-https://enters-post-patients-dale.trycloudflare.com/ask
+https://links-query-suse-connecting.trycloudflare.com/ask
 ```
 （用「获取访问令牌」一节的方法确认地址为最新）
 
@@ -61,10 +63,19 @@ https://enters-post-patients-dale.trycloudflare.com/ask
 成功（HTTP 200）：
 
 ```json
-{"reply": "可直接朗读的中文回答", "provider": "demo 或 glm"}
+{"reply": "可直接朗读的中文回答", "provider": "glm / voicenotes+glm / memory_create ..."}
 ```
 
 失败：HTTP 401 = 令牌错误；HTTP 400 = 请求体格式问题。
+
+## v0.2 新能力（快捷指令无需任何改动）
+
+同一句话入口已支持个人记忆，直接对手表说即可：
+
+- 「贾维斯，记一下，我的车停在B2层C36」→ 真实写入 Voicenotes
+- 「我的车停在哪里？」「我妈生日是什么时候？」→ 从你的 Voicenotes 记录里有据回答
+- 「总结一下今天的记录」→ 当日记录要点总结
+- 查不到记录时会如实说明，不会编造。
 
 ## 在 Apple Watch 上运行
 

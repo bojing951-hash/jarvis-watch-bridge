@@ -29,19 +29,29 @@ REDIRECT_PORT = 18765
 REDIRECT_URI = "http://localhost:%d/callback" % REDIRECT_PORT
 
 
+UA = "JarvisWatchBridge/0.2 (Voicenotes MCP OAuth)"
+
+
 def _get_json(url):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    req = urllib.request.Request(url, headers={"Accept": "application/json",
+                                               "User-Agent": UA})
     with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def discover():
-    """按 MCP 规范发现 authorization_server 与各端点."""
-    try:
-        pr = _get_json(ORIGIN + "/.well-known/oauth-protected-resource")
-        servers = pr.get("authorization_servers") or [ORIGIN]
-    except Exception:
-        servers = [ORIGIN]
+    """按 MCP 规范(RFC 9728)发现授权服务器; 优先 /mcp 路径专属元数据."""
+    servers = [ORIGIN]
+    for path in ("/.well-known/oauth-protected-resource/mcp",
+                 "/.well-known/oauth-protected-resource"):
+        try:
+            pr = _get_json(ORIGIN + path)
+            found = pr.get("authorization_servers")
+            if found:
+                servers = found
+                break
+        except Exception:
+            continue
     meta = {}
     for server in servers:
         try:
@@ -68,7 +78,8 @@ def register(meta):
         "response_types": ["code"],
     }).encode()
     req = urllib.request.Request(reg_url, data=body,
-                                 headers={"Content-Type": "application/json"}, method="POST")
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": UA}, method="POST")
     with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -89,13 +100,45 @@ class _Waiter(BaseHTTPRequestHandler):
         pass
 
 
-def wait_for_code():
+def wait_for_code(timeout=1800):
     server = HTTPServer(("127.0.0.1", REDIRECT_PORT), _Waiter)
     thread = threading.Thread(target=server.handle_request, daemon=True)
     thread.start()
-    thread.join(timeout=300)  # 最多等 5 分钟
+    thread.join(timeout=timeout)
     server.server_close()
     return _Waiter.code
+
+
+def save_state(meta, client_id, verifier):
+    """保存PKCE状态, 供手动兑换模式使用(手机等设备完成授权后回填)."""
+    state = {"client_id": client_id, "verifier": verifier,
+             "token_endpoint": meta["token_endpoint"]}
+    with open(os.path.join(BASE, ".run", "oauth_state.json"), "w") as f:
+        json.dump(state, f)
+
+
+def manual_exchange(callback_url):
+    """从浏览器地址栏复制的回调URL中提取code, 用保存的verifier换令牌."""
+    state_path = os.path.join(BASE, ".run", "oauth_state.json")
+    if not os.path.exists(state_path):
+        print("[oauth] 没有待兑换的授权状态, 请先运行一次授权流程")
+        sys.exit(1)
+    with open(state_path) as f:
+        state = json.load(f)
+    parsed = urllib.parse.urlparse(callback_url.strip())
+    code = (urllib.parse.parse_qs(parsed.query).get("code") or [None])[0]
+    if not code:
+        print("[oauth] 回调URL里没有找到 code 参数")
+        sys.exit(1)
+    tokens = exchange({"token_endpoint": state["token_endpoint"]},
+                      state["client_id"], code, state["verifier"])
+    token = tokens.get("access_token")
+    if not token:
+        print("[oauth] 兑换失败, 返回字段: " + ",".join(tokens.keys()))
+        sys.exit(1)
+    save_token(token)
+    os.remove(state_path)
+    print("[oauth] ✅ 手动兑换完成, 令牌已写入 .env, 重启Jarvis生效")
 
 
 def exchange(meta, client_id, code, verifier):
@@ -107,7 +150,8 @@ def exchange(meta, client_id, code, verifier):
         "code_verifier": verifier,
     }).encode()
     req = urllib.request.Request(meta["token_endpoint"], data=body,
-                                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                 headers={"Content-Type": "application/x-www-form-urlencoded",
+                                          "User-Agent": UA},
                                  method="POST")
     with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -132,6 +176,16 @@ def save_token(token):
 
 
 def main():
+    global REDIRECT_PORT, REDIRECT_URI
+    if len(sys.argv) >= 3 and sys.argv[1] == "--exchange":
+        manual_exchange(sys.argv[2])
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] == "--public-redirect":
+        # 公网HTTPS回调: 绕开Cloudflare WAF对http://localhost的重定向拦截
+        base = sys.argv[2].rstrip("/")
+        REDIRECT_PORT = 18766
+        REDIRECT_URI = base + "/callback"
+        print("[oauth] 公网回调模式: " + REDIRECT_URI)
     print("[oauth] 正在发现 Voicenotes 授权端点...")
     meta = discover()
     print("[oauth] 发现成功: authorization_endpoint 已获取")
@@ -142,17 +196,20 @@ def main():
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(
         hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    scope = (meta.get("scopes_supported") or ["mcp:use"])[0]
     params = {
         "response_type": "code",
         "client_id": client_id or "",
         "redirect_uri": REDIRECT_URI,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
-        "scope": "mcp:read mcp:write",
+        "scope": scope,
     }
     if not client_id:
         params.pop("client_id")
     url = meta["authorization_endpoint"] + "?" + urllib.parse.urlencode(params)
+    os.makedirs(os.path.join(BASE, ".run"), exist_ok=True)
+    save_state(meta, client_id, verifier)
     print("[oauth] 即将打开浏览器, 请登录 Voicenotes 并点击允许...")
     print("[oauth] 若浏览器未自动打开, 手动访问:\n" + url)
     webbrowser.open(url)

@@ -316,7 +316,11 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         started = time.monotonic()
-        reply, provider, intent = ask(question, session)
+        try:
+            reply, provider, intent = ask(question, session)
+        except Exception:  # 兜底: 任何意外异常也要让手表听到一句可朗读的话
+            log("internal_error session=%s" % session)
+            reply, provider, intent = "贾维斯内部出错了，请稍后再试一次。", "error", "unknown"
         ms = (time.monotonic() - started) * 1000
         METRICS["requests"] += 1
         METRICS["ok"] += 1

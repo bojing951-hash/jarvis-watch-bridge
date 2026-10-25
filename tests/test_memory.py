@@ -29,6 +29,18 @@ class TestRouterClassify(unittest.TestCase):
         intent, _ = router.classify("上周我关于AI Agent有哪些想法？")
         self.assertEqual(intent, router.SEARCH)
 
+    def test_search_kinship_and_personal_data(self):
+        for q in ("我妈生日是什么时候？", "我爸的电话是多少",
+                  "我的航班是几点的？", "我老婆的生日是哪天"):
+            intent, _ = router.classify(q)
+            self.assertEqual(intent, router.SEARCH, q)
+
+    def test_general_knowledge_not_search(self):
+        # 知识性问句不得误入记忆检索
+        for q in ("什么是通货膨胀", "美联储是干什么的？", "明天天气怎么样"):
+            intent, _ = router.classify(q)
+            self.assertEqual(intent, router.GENERAL, q)
+
     def test_summary_today(self):
         intent, payload = router.classify("总结一下今天做了什么")
         self.assertEqual(intent, router.SUMMARY)

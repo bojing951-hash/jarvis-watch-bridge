@@ -8,6 +8,7 @@
 """
 import json
 import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -27,7 +28,22 @@ class ProviderError(Exception):
 
 
 def answer(question, api_key, model, base_url, timeout=45, system=None):
-    """调用 GLM chat/completions, 返回纯文本回答. 失败抛 ProviderError.
+    """调用 GLM, 返回纯文本回答. 失败抛 ProviderError.
+
+    推理模型偶发只输出 reasoning_content 而 content 为空,
+    对该情况重试一次, 其余错误直接抛出.
+    """
+    try:
+        return _answer_once(question, api_key, model, base_url, timeout, system)
+    except ProviderError as e:
+        if "空回答" not in str(e):
+            raise
+        time.sleep(1)
+        return _answer_once(question, api_key, model, base_url, timeout, system)
+
+
+def _answer_once(question, api_key, model, base_url, timeout=45, system=None):
+    """单次调用 GLM chat/completions.
 
     v0.2: system 可覆盖 (记忆问答用更严格的不编造提示);
     不再读取 reasoning_content — 推理过程不是给用户朗读的答案.

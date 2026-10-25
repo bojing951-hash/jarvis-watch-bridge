@@ -22,13 +22,19 @@ _TOOL_HINTS = {
 # 日期参数在各家 schema 中的常见命名, 按命中顺序取
 _FROM_KEYS = ["date_from", "from", "start", "start_date", "startDate", "after", "begin"]
 _TO_KEYS = ["date_to", "to", "end", "end_date", "endDate", "before"]
+_RANGE_KEYS = ["date_range", "daterange", "range"]  # 合并式 [start, end] 数组参数
 _QUERY_KEYS = ["query", "q", "search", "text", "keywords"]
-_CONTENT_KEYS = ["content", "text", "note", "body", "message"]
-_TAGS_KEYS = ["tags", "tag"]
+_CONTENT_KEYS = ["transcript", "content", "text", "note", "body", "message"]
+_TAG_KEYS = ["tags", "tag"]
 
 
 class VoicenotesUnavailable(Exception):
     """Voicenotes 暂不可用或未授权 — 调用方需如实告知用户, 不得编造记忆."""
+
+
+def _next_day(date_iso):
+    from datetime import date, timedelta
+    return (date.fromisoformat(date_iso) + timedelta(days=1)).isoformat()
 
 
 def _pick(schema_props, candidates):
@@ -57,6 +63,7 @@ class VoicenotesClient:
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
                 "Authorization": "Bearer " + self.token,
+                "User-Agent": "JarvisWatchBridge/0.2 (Voicenotes MCP client)",
             },
             method="POST",
         )
@@ -142,8 +149,9 @@ class VoicenotesClient:
             if block.get("type") == "text":
                 parts.append(block.get("text", ""))
         text = "\n".join(parts).strip()
-        if (result or {}).get("isError") and not text:
-            raise VoicenotesUnavailable("Voicenotes 工具执行失败")
+        if (result or {}).get("isError"):
+            # 工具层失败必须如实上抛, 严禁包装成成功
+            raise VoicenotesUnavailable("Voicenotes 工具执行失败: " + text[:120])
         return text
 
     # ---- 面向 Jarvis 的语义接口 ----
@@ -154,9 +162,21 @@ class VoicenotesClient:
         return self._call("search", {key: query})
 
     def list_notes(self, date_from=None, date_to=None):
+        """按日期范围列出记录.
+
+        入参是本地日期(ISO); 若 schema 为合并式 date_range 数组, 转成
+        UTC 闭开区间 [当天00:00Z, 次日00:00Z], 保证覆盖整天.
+        (局限: 早上8点前录的记录会算进前一天, 对手表场景可接受)
+        """
         name = self._tool_name("list")
         props = self._tools.get(name, {})
         args = {}
+        rk = _pick(props, _RANGE_KEYS)
+        if date_from and rk:
+            start = date_from + "T00:00:00Z"
+            end_day = _next_day(date_to or date_from)
+            args[rk] = [start, end_day + "T00:00:00Z"]
+            return self._call("list", args)
         fk = _pick(props, _FROM_KEYS)
         tk = _pick(props, _TO_KEYS)
         if date_from and fk:
