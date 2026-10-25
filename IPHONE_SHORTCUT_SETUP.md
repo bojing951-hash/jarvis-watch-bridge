@@ -6,7 +6,7 @@
 ## 当前有效地址（v0.3 纯文本接口）
 
 ```
-https://saves-roses-remedies-cologne.trycloudflare.com/ask-text
+https://trainers-troubleshooting-genre-ballot.trycloudflare.com/ask-text
 ```
 
 ⚠️ **重要：Quick Tunnel 是临时地址，电脑端每次重启 Jarvis 后地址会变化。**
@@ -33,7 +33,7 @@ grep JARVIS_TOKEN /Users/cast/AI内容/贾维斯/JarvisWatchBridge/.env
 
 ### 动作二：URL
 ```
-https://saves-roses-remedies-cologne.trycloudflare.com/ask-text
+https://trainers-troubleshooting-genre-ballot.trycloudflare.com/ask-text
 ```
 （注意结尾是 **/ask-text**；用上面的方法确认地址为最新）
 
