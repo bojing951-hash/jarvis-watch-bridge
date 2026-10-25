@@ -80,6 +80,55 @@ class TestAPI(unittest.TestCase):
         code, _ = self.request("/nope")
         self.assertEqual(code, 404)
 
+    # ---- v0.2 新增 ----
+
+    def test_ask_too_long_question_returns_400(self):
+        code, body = self.request("/ask", "POST",
+                                  {"question": "长" * 600, "session": "watch"},
+                                  {"X-Jarvis-Key": TEST_TOKEN})
+        self.assertEqual(code, 400)
+        self.assertEqual(body["error"], "question_too_long")
+        self.assertIn("reply", body)
+
+    def test_ask_response_contains_intent(self):
+        code, body = self.request("/ask", "POST",
+                                  {"question": "什么是逆回购？", "session": "watch"},
+                                  {"X-Jarvis-Key": TEST_TOKEN})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["intent"], "general_question")
+
+    def test_metrics_requires_auth(self):
+        code, _ = self.request("/metrics")
+        self.assertEqual(code, 401)
+
+    def test_metrics_shape(self):
+        code, body = self.request("/metrics", headers={"X-Jarvis-Key": TEST_TOKEN})
+        self.assertEqual(code, 200)
+        for key in ("requests", "http_success_rate", "answer_success_rate",
+                    "answers_ok", "answers_degraded", "answers_failed",
+                    "avg_latency_ms", "intents", "model_calls",
+                    "search_calls", "mcp_calls"):
+            self.assertIn(key, body)
+
+    def test_health_reports_memory_and_version(self):
+        code, body = self.request("/health")
+        self.assertEqual(code, 200)
+        self.assertIn(body["memory"], ("enabled", "disabled"))
+        self.assertEqual(body["version"], "0.3")
+
+    def test_logs_never_contain_question_text(self):
+        """v0.2 隐私要求: 服务端日志不得出现问题正文."""
+        import io
+        import contextlib
+        secret = "绝密隐私问题XYZ789"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code, _ = self.request("/ask", "POST",
+                                   {"question": secret, "session": "watch"},
+                                   {"X-Jarvis-Key": TEST_TOKEN})
+            self.assertEqual(code, 200)
+        self.assertNotIn(secret, buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
