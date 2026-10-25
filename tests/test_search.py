@@ -27,6 +27,30 @@ class TestNeedSearch(unittest.TestCase):
         self.assertFalse(web_search.need_search(""))
         self.assertFalse(web_search.need_search(None))
 
+    def test_private_questions_never_searched(self):
+        """隐私护栏: 私人指涉问题不得发往公开搜索服务."""
+        for q in ("今天我花了多少钱", "我的车值多少钱", "我买了什么",
+                  "我妈的身体怎么样", "昨天我花了多少"):
+            self.assertFalse(web_search.need_search(q), q)
+
+    def test_explicit_search_overrides_privacy_guard(self):
+        # 用户明确要求搜索时允许 (用户指令优先)
+        self.assertTrue(web_search.need_search("帮我搜一下我妈生日礼物推荐"))
+
+    def test_public_realtime_still_searched(self):
+        for q in ("今天美元兑人民币汇率多少", "现在几点了"):
+            self.assertTrue(web_search.need_search(q), q)
+
+
+class TestPersonalSpendingRouting(unittest.TestCase):
+    """私人消费问句应进 Voicenotes 记忆, 而非公开搜索."""
+
+    def test_spending_questions_are_memory_search(self):
+        for q in ("今天我花了多少钱", "昨天我花了多少",
+                  "我这个月买了什么东西", "最近我开销大吗"):
+            intent, _ = router.classify(q)
+            self.assertEqual(intent, router.SEARCH, q)
+
 
 class TestParseDate(unittest.TestCase):
     def test_formats(self):
@@ -54,6 +78,16 @@ class TestFilterFresh(unittest.TestCase):
         # 无日期结果不得作为"最新数据"依据
         fresh = web_search.filter_fresh([self._r("")], days=7, today=self.TODAY)
         self.assertEqual(fresh, [])
+
+
+class TestFreshWindow(unittest.TestCase):
+    def test_market_questions_wider_window(self):
+        self.assertEqual(web_search.fresh_window("美元兑人民币汇率多少"), 14)
+        self.assertEqual(web_search.fresh_window("黄金行情怎么样"), 14)
+
+    def test_other_questions_7_days(self):
+        self.assertEqual(web_search.fresh_window("最新AI新闻"), 7)
+        self.assertEqual(web_search.fresh_window("今天天气"), 7)
 
 
 class TestBuildContext(unittest.TestCase):

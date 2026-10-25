@@ -223,8 +223,9 @@ def handle_realtime(question):
         return SEARCH_STALE_REPLY, "search_error"
     ctx()["search_ms"] = (time.monotonic() - started) * 1000
     audit_search_sources(ctx()["rid"], question, results)
-    fresh = web_search.filter_fresh(results, days=7)
-    log("search: %d results, %d fresh (7d)" % (len(results), len(fresh)))
+    days = web_search.fresh_window(question)  # 行情类14天(周末休市), 其他7天
+    fresh = web_search.filter_fresh(results, days=days)
+    log("search: %d results, %d fresh (%dd)" % (len(results), len(fresh), days))
     if not fresh:
         # 结果全旧/无日期: 不拿旧数据冒充最新, 诚实告知
         return SEARCH_STALE_REPLY, "search_stale"

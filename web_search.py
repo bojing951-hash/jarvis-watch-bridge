@@ -35,6 +35,12 @@ _TIME_RE = re.compile(
 _EXPLICIT_RE = re.compile(r"帮我搜|搜索一下|搜一下|上网搜|上网查|网上查|查一下最新", re.IGNORECASE)
 # 概念解释类, 即使含时间词也不联网 (例如"今天讲的通货膨胀是什么")
 _CONCEPT_RE = re.compile(r"什么是|是什么意思|怎么理解|解释一下|定义是", re.IGNORECASE)
+# 隐私护栏: 带私人指涉的问题不得发给公开搜索服务 (用户明确要求搜索除外)
+_PERSONAL_RE = re.compile(
+    r"我的|我(花了|花掉|买了|买过|记过|说过|存过|提过)"
+    r"|我(妈|爸|老婆|老公|对象|媳妇|儿子|女儿|孩子|领导)",
+    re.IGNORECASE,
+)
 
 
 class SearchError(Exception):
@@ -42,13 +48,18 @@ class SearchError(Exception):
 
 
 def need_search(question):
-    """判定该问题是否需要联网: 只有明确要求或带时效指涉才联网."""
+    """判定该问题是否需要联网: 只有明确要求或带时效指涉才联网.
+
+    顺序即优先级: 明确搜索 > 隐私护栏(不外发) > 概念题(不联网) > 时效词.
+    """
     q = (question or "").strip()
     if not q:
         return False
     if _EXPLICIT_RE.search(q):
         return True
-    if _CONCEPT_RE.search(q) and not _EXPLICIT_RE.search(q):
+    if _PERSONAL_RE.search(q):
+        return False  # 私人指涉的问题绝不发往公开搜索
+    if _CONCEPT_RE.search(q):
         # 概念题: 默认不联网, 除非时效词直接修饰行情(如"今天的汇率")
         return bool(re.search(r"行情|汇率|股价|价格|新闻", q))
     return bool(_TIME_RE.search(q))
@@ -57,10 +68,21 @@ def need_search(question):
 # 口语填充词: 进搜索框前去掉, 否则引擎被带偏 (实测对比明显)
 _FILLER_RE = re.compile(
     r"贾维斯|jarvis|请问|帮我|麻烦|一下|现在|目前|当前|今天|今日|最新|最近|实时"
-    r"|是在|还是|了|呢|吗|啊|吧|么|什么|怎么|有没有|告诉我"
+    r"|是在|还是|了|呢|吗|啊|吧|么|什么|怎么|有没有|告诉我|多少"
     r"|[，。？！,?!\\s]+",
     re.IGNORECASE,
 )
+
+# 行情类问题: 市场周末/节假日休市, 最近数据可能超过7天, 放宽到14天
+_MARKET_RE = re.compile(
+    r"汇率|行情|股价|币价|美元|人民币|欧元|日元|英镑|黄金|原油|指数|A?股|基金|中间价",
+    re.IGNORECASE,
+)
+
+
+def fresh_window(question):
+    """新鲜度窗口: 行情类14天(覆盖周末休市), 其他7天."""
+    return 14 if _MARKET_RE.search(question or "") else 7
 
 
 def optimize_query(question, today=None):
