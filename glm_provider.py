@@ -9,12 +9,22 @@
 import json
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
 # 直连 opener: 绕过系统/环境代理 (本机 Clash 代理会拦截国内 API 与本地回环请求)
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# 最近一次调用的元数据 (线程局部): finish_reason / token 用量 / 重试次数.
+# 只用于日志诊断 (server 汇总进请求日志行), 不含问题与回答内容.
+_tls = threading.local()
+
+
+def last_meta():
+    """返回最近一次 answer() 的元数据 dict (本线程), 无则空 dict."""
+    return getattr(_tls, "meta", None) or {}
 
 SYSTEM_PROMPT = (
     "你是随身语音助手Jarvis，通过AirPods向用户朗读回答。规则："
@@ -35,7 +45,10 @@ def answer(question, api_key, model, base_url, timeout=45, system=None, retries=
     对该情况最多重试 retries 次, 其余错误直接抛出.
     """
     last = None
+    attempts = 0
     for _ in range(retries + 1):
+        attempts += 1
+        _tls.meta = {"attempts": attempts}
         try:
             return _answer_once(question, api_key, model, base_url, timeout, system)
         except ProviderError as e:
@@ -62,7 +75,9 @@ def _answer_once(question, api_key, model, base_url, timeout=45, system=None):
             {"role": "user", "content": question},
         ],
         "temperature": 0.3,
-        "max_tokens": 600,
+        # 推理模型的 completion_tokens 含思考段(实测127字回答耗594),
+        # 留足余量防止 finish=length 把正文截掉
+        "max_tokens": 800,
     }
     req = urllib.request.Request(
         url,
@@ -104,6 +119,13 @@ def _answer_once(question, api_key, model, base_url, timeout=45, system=None):
     if not reply:
         # v0.2: 空 content 一律视为失败, 不朗读 reasoning_content
         raise ProviderError("GLM返回了空回答")
+    usage = data.get("usage") or {}
+    _tls.meta = {
+        "finish": choice.get("finish_reason") or "?",
+        "ctok": usage.get("completion_tokens"),
+        "ptok": usage.get("prompt_tokens"),
+        "attempts": (getattr(_tls, "meta", None) or {}).get("attempts", 1),
+    }
     if choice.get("finish_reason") == "length":
         # 达到 token 上限被截断: 保留内容但记录, 供排查"朗读不完整"
         sys.stderr.write("[glm] 回答被 max_tokens 截断(%d字)\n" % len(reply))

@@ -302,6 +302,35 @@ class TestRealtimeHandlerFallback(unittest.TestCase):
             web_search.search = orig_search
             server.glm_answer = orig_glm
 
+    def test_slim_context_recovery_after_empties(self):
+        """P0: 大上下文连空后, 瘦身上下文(2条/100字)再试一次可救回."""
+        import glm_provider
+        import server
+        fresh = [{"publish_date": "2026-10-24", "title": "标题%d" % i,
+                  "content": "内容" * 60, "media": "m", "link": "l%d" % i}
+                 for i in range(4)]
+        prompts = []
+
+        def fake_glm(prompt, system=None, retries=1):
+            prompts.append(len(prompt))
+            if len(prompts) <= 1:  # glm_answer 内部自带重试由 retries=0 控制, 这里只模拟: 大上下文必空
+                raise glm_provider.ProviderError("GLM返回了空回答")
+            if len(prompt) > 700:  # 完整上下文(4条/160字)仍失败
+                raise glm_provider.ProviderError("GLM返回了空回答")
+            return "瘦身救回的回答"
+
+        orig_search, orig_glm = web_search.search, server.glm_answer
+        web_search.search = lambda query, **kw: fresh
+        server.glm_answer = fake_glm
+        try:
+            reply, provider = server.handle_realtime("现在美元汇率多少")
+            self.assertEqual(reply, "瘦身救回的回答")
+            self.assertEqual(provider, "search+glm")
+            self.assertLess(prompts[-1], 700)  # 最后一次确实是瘦身上下文
+        finally:
+            web_search.search = orig_search
+            server.glm_answer = orig_glm
+
 
 class TestOptimizeQuery(unittest.TestCase):
     def test_filler_stripped_and_date_anchored(self):
@@ -320,6 +349,178 @@ class TestOptimizeQuery(unittest.TestCase):
                                       today=date(2026, 10, 25))
         for term in ("离岸人民币", "升值", "贬值"):
             self.assertIn(term, q)
+
+    def test_english_terms_not_mangled(self):
+        """P0回归: 填充词正则曾把 \\s 写成字面's', 吃掉 USD 里的 S."""
+        from datetime import date
+        q = web_search.optimize_query(
+            "最新美元兑离岸人民币 USD/CNH 汇率是多少",
+            today=date(2026, 10, 26))
+        self.assertIn("USD/CNH", q)
+
+    def test_relative_time_noise_stripped(self):
+        """P0回归: '过去24小时''哪些''重要' 这类口语噪声不进查询词."""
+        from datetime import date
+        q = web_search.optimize_query("过去24小时有哪些重要的AI行业新闻？",
+                                      today=date(2026, 10, 26))
+        for noise in ("过去24小时", "哪些", "重要"):
+            self.assertNotIn(noise, q)
+        self.assertIn("AI行业新闻", q)
+
+
+class TestContentDate(unittest.TestCase):
+    """P0: 无日期结果按正文自报日期判定, 不再一律丢弃."""
+
+    TODAY = date(2026, 10, 26)
+
+    def _r(self, content, publish=""):
+        return {"publish_date": publish, "title": "t", "content": content,
+                "media": "m", "link": "l"}
+
+    def test_chinese_date_in_content(self):
+        r = self._r("2026年10月16日美元/人民币报6.7220，下调33点")
+        self.assertEqual(web_search.content_date(r, today=self.TODAY),
+                         date(2026, 10, 16))
+
+    def test_iso_date_in_content(self):
+        r = self._r("出处：北京商报 2026-10-08 离岸人民币盘中升破6.70关口")
+        self.assertEqual(web_search.content_date(r, today=self.TODAY),
+                         date(2026, 10, 8))
+
+    def test_month_day_assumes_current_year(self):
+        r = self._r("10月24日，南京物理AI大会开幕")
+        self.assertEqual(web_search.content_date(r, today=self.TODAY),
+                         date(2026, 10, 24))
+
+    def test_future_date_rejected(self):
+        r = self._r("2026年12月31日预告")
+        self.assertIsNone(web_search.content_date(r, today=self.TODAY))
+
+    def test_no_date_none(self):
+        self.assertIsNone(web_search.content_date(self._r("没有任何日期"), self.TODAY))
+
+    def test_effective_date_prefers_publish(self):
+        r = self._r("2026年10月24日的内容日期", publish="2026-10-19")
+        self.assertEqual(web_search.effective_date(r, today=self.TODAY),
+                         date(2026, 10, 19))
+
+    def test_undated_with_content_date_counts_fresh(self):
+        results = [self._r("2026年10月24日重要数据发布")]
+        fresh = web_search.filter_fresh(results, days=7, today=self.TODAY)
+        self.assertEqual(len(fresh), 1)
+
+    def test_undated_without_date_still_stale(self):
+        # 完全拿不到日期依据: 宁可不用
+        results = [self._r("没有提到任何日期的页面")]
+        fresh = web_search.filter_fresh(results, days=7, today=self.TODAY)
+        self.assertEqual(fresh, [])
+
+
+class TestSearchRecencyParam(unittest.TestCase):
+    """P0: search() 支持官方 search_recency_filter, 且确实放进请求体."""
+
+    def test_recency_in_payload(self):
+        import json as _json
+
+        class FakeResp:
+            def read(self):
+                return _json.dumps({"search_result": []}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class FakeOpener:
+            def __init__(self):
+                self.payload = None
+
+            def open(self, req, timeout=None):
+                self.payload = _json.loads(req.data.decode())
+                return FakeResp()
+
+        fake = FakeOpener()
+        orig = web_search.DIRECT_OPENER
+        web_search.DIRECT_OPENER = fake
+        try:
+            web_search.search("测试 查询", api_key="k", recency="oneWeek")
+        finally:
+            web_search.DIRECT_OPENER = orig
+        self.assertEqual(fake.payload.get("search_recency_filter"), "oneWeek")
+        self.assertEqual(fake.payload.get("count"), web_search.DEFAULT_COUNT)
+
+
+class TestSupplementSearch(unittest.TestCase):
+    """P0: 行情方向题缺可比基准时, 有目的地补搜一次(去重、有上限)."""
+
+    def _r(self, link, content, publish="2026-10-25"):
+        return {"publish_date": publish, "title": "t", "content": content,
+                "media": "m", "link": link}
+
+    def test_supplement_fires_without_basis(self):
+        import server
+        calls = []
+        no_basis = [self._r("a", "离岸人民币报6.68，创今年新高")]
+        with_basis = [self._r("b", "中间价报6.7208，较前一交易日上调12个基点")]
+        orig_search, orig_glm = web_search.search, server.glm_answer
+        web_search.search = lambda query, **kw: calls.append(query) or (
+            no_basis if len(calls) == 1 else with_basis)
+        server.glm_answer = lambda prompt, system=None, retries=1: "回答"
+        try:
+            reply, provider = server.handle_realtime("离岸人民币在升值还是贬值")
+            self.assertEqual(provider, "search+glm")
+            self.assertEqual(len(calls), 2)  # 主查询 + 补充一次, 到此为止
+        finally:
+            web_search.search = orig_search
+            server.glm_answer = orig_glm
+
+    def test_no_supplement_when_basis_present(self):
+        import server
+        calls = []
+        with_basis = [self._r("a", "离岸人民币报6.6817，较前一交易日上涨37个基点")]
+        orig_search, orig_glm = web_search.search, server.glm_answer
+        web_search.search = lambda query, **kw: calls.append(query) or with_basis
+        server.glm_answer = lambda prompt, system=None, retries=1: "回答"
+        try:
+            reply, provider = server.handle_realtime("离岸人民币在升值还是贬值")
+            self.assertEqual(provider, "search+glm")
+            self.assertEqual(len(calls), 1)
+        finally:
+            web_search.search = orig_search
+            server.glm_answer = orig_glm
+
+    def test_supplement_dedupes_by_link(self):
+        import server
+        calls = []
+        only = [self._r("a", "离岸人民币报6.68，没有对比基准")]
+        orig_search, orig_glm = web_search.search, server.glm_answer
+        web_search.search = lambda query, **kw: calls.append(query) or only
+        prompts = []
+        server.glm_answer = lambda prompt, system=None, retries=1: prompts.append(1) or "回答"
+        try:
+            reply, provider = server.handle_realtime("离岸人民币在升值还是贬值")
+            self.assertEqual(provider, "search+glm")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(prompts), 1)
+        finally:
+            web_search.search = orig_search
+            server.glm_answer = orig_glm
+
+    def test_non_direction_question_no_supplement(self):
+        import server
+        calls = []
+        fresh = [self._r("a", "没有基准词的普通新闻内容")]
+        orig_search, orig_glm = web_search.search, server.glm_answer
+        web_search.search = lambda query, **kw: calls.append(query) or fresh
+        server.glm_answer = lambda prompt, system=None, retries=1: "回答"
+        try:
+            reply, provider = server.handle_realtime("最新的AI新闻有哪些")
+            self.assertEqual(provider, "search+glm")
+            self.assertEqual(len(calls), 1)
+        finally:
+            web_search.search = orig_search
+            server.glm_answer = orig_glm
 
 
 if __name__ == "__main__":

@@ -21,7 +21,9 @@ from datetime import date, datetime, timedelta, timezone
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DEFAULT_ENGINE = "search_pro"
-DEFAULT_COUNT = 6
+# 实测(2026-10-26): count=6 时行情题常只留 1 条新鲜结果, 10 条显著提升召回
+# (C题 fresh 1→3), 且计费按次不按条; 上下文侧仍由 build_context 收前4条控制大小.
+DEFAULT_COUNT = 10
 DEFAULT_TIMEOUT = 10.0  # 典型2-3s; 上限压住, 给上层重试留时间预算
 
 # 触发联网的时效/实时词 (问的是"现在的状态"而非"概念")
@@ -66,10 +68,13 @@ def need_search(question):
 
 
 # 口语填充词: 进搜索框前去掉, 否则引擎被带偏 (实测对比明显)
+# 注意: 标点类必须是 \s 不能写成 \\s —— raw串里后者等于"字面反斜杠+字面s",
+# 会把 USD/特斯拉(Tesla) 里的字母 s 一并吃掉 (P0实测踩坑).
 _FILLER_RE = re.compile(
     r"贾维斯|jarvis|请问|帮我|麻烦|一下|现在|目前|当前|今天|今日|最新|最近|实时"
-    r"|是在|还是|了|呢|吗|啊|吧|么|什么|怎么|有没有|告诉我|多少|的|有|是"
-    r"|[，。？！,?!\\s]+",
+    r"|过去\d+小时|过去\d+天|哪些|重要|是在|还是|了|呢|吗|啊|吧|么|什么|怎么"
+    r"|有没有|告诉我|多少|的|有|是"
+    r"|[，。？！,?!\s]+",
     re.IGNORECASE,
 )
 
@@ -112,13 +117,56 @@ def parse_date(value):
         return None
 
 
+# 内容里自报日期的常见写法: "2026年10月16日" / "2026-10-16" / "10月16日"(当年)
+_CONTENT_DATE_RE = re.compile(
+    r"(\d{4})年(\d{1,2})月(\d{1,2})日|(\d{4})-(\d{1,2})-(\d{1,2})|(?:^|[^\d])(\d{1,2})月(\d{1,2})日")
+
+
+def content_date(result, today=None, scan_chars=200):
+    """从正文开头提取结果自报的数据日期 (publish_date 缺失时的判断依据).
+
+    只认开头一段: 行情/新闻稿的日期几乎都在首段; 深挖正文会命中历史罗列
+    (如"2026年01月最低价"), 反而把新页面误判成旧数据.
+    未来日期视为解析失败 (不采信).
+    """
+    today = today or date.today()
+    text = (result.get("content") or "")[:scan_chars]
+    m = _CONTENT_DATE_RE.search(text)
+    if not m:
+        return None
+    try:
+        if m.group(1):
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        elif m.group(4):
+            d = date(int(m.group(4)), int(m.group(5)), int(m.group(6)))
+        else:
+            d = date(today.year, int(m.group(7)), int(m.group(8)))
+    except ValueError:
+        return None
+    return d if d <= today else None
+
+
+def effective_date(result, today=None):
+    """结果的生效日期: 优先 publish_date; 缺失时用正文自报日期; 都没有返回 None.
+
+    无日期既不自动当新、也不自动当旧 —— 只有正文给出明确日期才作为判断依据.
+    """
+    d = parse_date(result.get("publish_date"))
+    if d:
+        return d
+    return content_date(result, today=today)
+
+
 def filter_fresh(results, days=7, today=None):
-    """保留发布日期在 N 天内的结果; 无日期的结果不作为"新鲜"依据."""
+    """保留生效日期(publish_date 或正文自报日期)在 N 天内的结果.
+
+    完全无日期的结果仍不作为"新鲜"依据 (拿不到依据就宁可不用).
+    """
     today = today or date.today()
     horizon = today - timedelta(days=days)
     fresh = []
     for r in results:
-        d = parse_date(r.get("publish_date"))
+        d = effective_date(r, today=today)
         if d and d >= horizon:
             fresh.append(r)
     return fresh
@@ -126,11 +174,17 @@ def filter_fresh(results, days=7, today=None):
 
 def search(query, count=DEFAULT_COUNT, engine=DEFAULT_ENGINE,
            base_url="https://open.bigmodel.cn/api/paas/v4", api_key="",
-           timeout=DEFAULT_TIMEOUT):
-    """调用智谱独立搜索API, 返回结果列表(可能为空). 失败抛 SearchError."""
+           timeout=DEFAULT_TIMEOUT, recency=None):
+    """调用智谱独立搜索API, 返回结果列表(可能为空). 失败抛 SearchError.
+
+    recency: 官方 search_recency_filter (实测生效: oneWeek 让新闻题 10 条
+    全部落在 7 天内); None=不限制. 服务端 filter_fresh 仍作最终把关.
+    """
     if not api_key:
         raise SearchError("未配置搜索所需的 GLM_API_KEY")
     payload = {"search_engine": engine, "search_query": query, "count": count}
+    if recency:
+        payload["search_recency_filter"] = recency
     req = urllib.request.Request(
         base_url.rstrip("/") + "/web_search",
         data=json.dumps(payload).encode("utf-8"),
@@ -171,11 +225,13 @@ def build_context(question, results, today=None, max_results=4, snippet_chars=16
     sources = []
     for i, r in enumerate(results[:max_results], 1):
         snippet = re.sub(r"\s+", " ", r["content"])[:snippet_chars]
+        eff = effective_date(r, today=today)
         lines.append("[{i}] 日期:{d} 来源:{m}\n{t}\n{s}".format(
-            i=i, d=r["publish_date"] or "无日期", m=r["media"] or "未知",
+            i=i, d=eff.isoformat() if eff else "无日期", m=r["media"] or "未知",
             t=r["title"][:60], s=snippet))
         sources.append({"date": r["publish_date"], "media": r["media"],
                         "title": r["title"][:60], "link": r["link"]})
-    context = ("用户问题: %s\n\n以下是搜索结果(今天是%s, 只依据这些结果回答):\n%s"
+    context = ("用户问题: %s\n\n以下是搜索结果(今天是%s, 只依据这些结果回答,"
+               "标注日期为发布日期或正文自报日期):\n%s"
                % (question, today.isoformat(), "\n\n".join(lines)))
     return context, sources

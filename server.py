@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -161,7 +162,12 @@ SEARCH_SYSTEM = (
     "4.金融方向判断要特别小心：美元兑人民币(USD/CNH)数值上升=人民币贬值，"
     "数值下降=人民币升值，先在结果里找到具体数字再下结论，拿不准就说数据不足;"
     "5.如果搜索结果不足以回答（数据太旧、没有相关数字），直接说明没查到可靠"
-    "的最新数据，建议稍后再问，不要用旧数据冒充最新行情。"
+    "的最新数据，建议稍后再问，不要用旧数据冒充最新行情;"
+    "6.判断汇率涨跌方向必须有同一口径、两个时点的可比数据（如'中间价X，较前"
+    "一交易日调升Y点'），只有一个时点的报价就说不出方向对比，别用发布时间或"
+    "标题措辞冒充行情对比;"
+    "7.用户限定时间范围（如'过去24小时'）而结果日期更早时，如实说明实际日期"
+    "范围，不得把更早的内容说成用户要的时间段。"
 )
 
 
@@ -222,6 +228,12 @@ def _transient_search_error(err):
     return True
 
 
+# 行情方向题的"可比基准"特征: 结果正文出现即认为拿到了两个时点的对比
+_BASIS_RE = re.compile(r"较前|上一交易|上一日|前一交易|前收|基点|环比|较上个")
+# 用户在问"涨跌方向"的问题特征
+_DIRECTION_RE = re.compile(r"升值|贬值|涨了|跌了|上涨|下跌|走高|走低|涨还是跌")
+
+
 def handle_realtime(question):
     """需要实时信息的问题: 搜索→过滤新鲜结果→模型组织口语回答.
 
@@ -231,15 +243,22 @@ def handle_realtime(question):
     search_stale      有结果但全超出新鲜度窗口
     model_error       搜索成功但GLM连续空回答/报错
     """
-    METRICS["search_calls"] += 1
+    def _search(q, **kw):
+        # 指标按真实API调用计数(主查询/降级重试/补充搜索各算一次)
+        METRICS["search_calls"] += 1
+        return web_search.search(q, api_key=GLM_KEY, **kw)
+
     query = web_search.optimize_query(question)
     bare = query.rsplit(" ", 1)[0]  # 去日期锚点的降级查询
+    days = web_search.fresh_window(question)  # 行情类14天(周末休市), 其他7天
+    # 官方时间过滤(实测生效: oneWeek让新闻题全部落在7天内); 服务端过滤仍二次把关
+    recency = "oneMonth" if days > 7 else "oneWeek"
     started = time.monotonic()
     results = []
     first_error = None
     for attempt, q in enumerate((query, bare)):
         try:
-            results = web_search.search(q, api_key=GLM_KEY)
+            results = _search(q, recency=recency)
         except web_search.SearchError as e:
             METRICS["search_errors"] += 1
             log("search error (attempt %d): %s" % (attempt + 1, e))
@@ -260,9 +279,24 @@ def handle_realtime(question):
             return SEARCH_REPLIES["search_api_error"], "search_api_error"
         return SEARCH_REPLIES["search_no_results"], "search_no_results"
     audit_search_sources(ctx()["rid"], question, results)
-    days = web_search.fresh_window(question)  # 行情类14天(周末休市), 其他7天
     fresh = web_search.filter_fresh(results, days=days)
     log("search: %d results, %d fresh (%dd)" % (len(results), len(fresh), days))
+    # 有目的的补充搜索(仅一次): 行情方向题但新鲜结果里没有可比基准/没有新鲜
+    # 结果时, 放开时间过滤补搜一次, 争取拿到带"较前一日"的报价; 结果按链接去重
+    needs_basis = bool(_DIRECTION_RE.search(question)) and not any(
+        _BASIS_RE.search(r.get("content") or "") for r in fresh)
+    if needs_basis and ctx()["search_ms"] < 25000:
+        try:
+            more = _search(bare)
+            extra = web_search.filter_fresh(more, days=days)
+            seen_links = {r.get("link") for r in fresh}
+            extra = [r for r in extra if r.get("link") not in seen_links]
+            if extra:
+                log("search supplement: +%d fresh" % len(extra))
+                fresh.extend(extra)
+        except web_search.SearchError as e:
+            METRICS["search_errors"] += 1
+            log("search supplement error: %s" % e)
     if not fresh:
         # 有结果但全旧: 不拿旧数据冒充最新, 诚实告知
         return SEARCH_REPLIES["search_stale"], "search_stale"
@@ -273,7 +307,16 @@ def handle_realtime(question):
         return reply, "search+glm"
     except glm_provider.ProviderError as e:
         log("GLM error after search: %s" % e)
-        return SEARCH_REPLIES["model_error"], "model_error"
+        # 最后手段: 换瘦身上下文(前2条/100字)再试一次 — 实测上下文越大
+        # 空回答率越高, 数据到手不轻易放弃
+        try:
+            small_ctx, _s = web_search.build_context(
+                question, fresh[:2], max_results=2, snippet_chars=100)
+            reply = glm_answer(small_ctx, system=SEARCH_SYSTEM, retries=0)
+            log("GLM recovered with slim context")
+            return reply, "search+glm"
+        except glm_provider.ProviderError:
+            return SEARCH_REPLIES["model_error"], "model_error"
 
 
 def _mcp_op(fn, *args):
@@ -533,13 +576,20 @@ class Handler(BaseHTTPRequestHandler):
             METRICS["answers_degraded"] += 1
         else:
             METRICS["answers_ok"] += 1
-        # 隐私: 只记会话/意图/来源/分段耗时/字数, 不记录问题正文
+        # 隐私: 只记会话/意图/来源/分段耗时/字数/模型元数据, 不记录问题正文
+        glm_tail = ""
+        if ctx()["model_ms"]:
+            meta = glm_provider.last_meta()
+            if meta:
+                glm_tail = " finish=%s ctok=%s tries=%s" % (
+                    meta.get("finish", "-"), meta.get("ctok", "-"),
+                    meta.get("attempts", "-"))
         log("rid=%s session=%s intent=%s provider=%s http=200 "
             "model=%.0fms search=%.0fms mcp=%.0fms total=%.1fms "
-            "qchars=%d rchars=%d"
+            "qchars=%d rchars=%d%s"
             % (rid, session, intent, provider, ctx()["model_ms"],
                ctx()["search_ms"], ctx()["mcp_ms"], ms,
-               len(question), len(reply)))
+               len(question), len(reply), glm_tail))
         if plain:
             self._text(200, reply)
         else:
