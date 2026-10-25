@@ -28,19 +28,22 @@ class ProviderError(Exception):
     """带用户可读中文信息的模型调用失败."""
 
 
-def answer(question, api_key, model, base_url, timeout=45, system=None):
+def answer(question, api_key, model, base_url, timeout=45, system=None, retries=1):
     """调用 GLM, 返回纯文本回答. 失败抛 ProviderError.
 
     推理模型偶发只输出 reasoning_content 而 content 为空,
-    对该情况重试一次, 其余错误直接抛出.
+    对该情况最多重试 retries 次, 其余错误直接抛出.
     """
-    try:
-        return _answer_once(question, api_key, model, base_url, timeout, system)
-    except ProviderError as e:
-        if "空回答" not in str(e):
-            raise
-        time.sleep(1)
-        return _answer_once(question, api_key, model, base_url, timeout, system)
+    last = None
+    for _ in range(retries + 1):
+        try:
+            return _answer_once(question, api_key, model, base_url, timeout, system)
+        except ProviderError as e:
+            if "空回答" not in str(e):
+                raise
+            last = e
+            time.sleep(1)
+    raise last
 
 
 def _answer_once(question, api_key, model, base_url, timeout=45, system=None):

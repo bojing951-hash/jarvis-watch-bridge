@@ -132,13 +132,13 @@ def vn_client():
 
 # ---------- GLM 辅助 ----------
 
-def glm_answer(prompt, system=None):
+def glm_answer(prompt, system=None, retries=1):
     """调用 GLM 并计入指标与分段耗时; 失败抛 ProviderError(不含敏感配置)."""
     METRICS["model_calls"] += 1
     started = time.monotonic()
     try:
         return glm_provider.answer(prompt, GLM_KEY, GLM_MODEL, GLM_BASE, GLM_TIMEOUT,
-                                   system=system)
+                                   system=system, retries=retries)
     except glm_provider.ProviderError:
         METRICS["model_errors"] += 1
         raise
@@ -188,8 +188,13 @@ MEMORY_DEGRADE = ("Jarvis的记忆功能还没有连接Voicenotes，"
 
 # ---------- 意图处理器 ----------
 
-SEARCH_STALE_REPLY = ("这题需要最新信息，我刚搜了一下，但没拿到可靠的最新数据，"
-                      "不敢瞎说。麻烦稍后再问一次，或者换个说法试试。")
+# 搜索路径失败分类: 不同环节不同话术, 不再用一句话掩盖所有故障
+SEARCH_REPLIES = {
+    "search_api_error": "联网搜索服务这会儿访问不了，稍后再试一次。",
+    "search_no_results": "我联网搜了，但没搜到相关内容，换个说法再试试。",
+    "search_stale": "搜到了一些结果，但都不是最近的数据，不敢拿来当最新情况说，稍后再问。",
+    "model_error": "资料查到了，但我组织回答时出了点问题，请再问一次。",
+}
 
 
 def audit_search_sources(rid, question, results):
@@ -209,33 +214,66 @@ def audit_search_sources(rid, question, results):
         pass  # 留档失败不影响回答
 
 
+def _transient_search_error(err):
+    """瞬时类搜索错误(超时/网络/5xx/429)可重试; 鉴权类重试无意义."""
+    msg = str(err)
+    if "HTTP 4" in msg and "HTTP 429" not in msg:
+        return False
+    return True
+
+
 def handle_realtime(question):
-    """需要实时信息的问题: 搜索→过滤新鲜结果→模型组织口语回答."""
+    """需要实时信息的问题: 搜索→过滤新鲜结果→模型组织口语回答.
+
+    失败分类(服务端可区分, 话术不同):
+    search_api_error  搜索接口异常(瞬时错误重试一次后仍失败)
+    search_no_results 两次查询均无结果
+    search_stale      有结果但全超出新鲜度窗口
+    model_error       搜索成功但GLM连续空回答/报错
+    """
     METRICS["search_calls"] += 1
     query = web_search.optimize_query(question)
+    bare = query.rsplit(" ", 1)[0]  # 去日期锚点的降级查询
     started = time.monotonic()
-    try:
-        results = web_search.search(query, api_key=GLM_KEY)
-    except web_search.SearchError as e:
-        METRICS["search_errors"] += 1
-        ctx()["search_ms"] = (time.monotonic() - started) * 1000
-        log("search failed: %s" % e)
-        return SEARCH_STALE_REPLY, "search_error"
+    results = []
+    first_error = None
+    for attempt, q in enumerate((query, bare)):
+        try:
+            results = web_search.search(q, api_key=GLM_KEY)
+        except web_search.SearchError as e:
+            METRICS["search_errors"] += 1
+            log("search error (attempt %d): %s" % (attempt + 1, e))
+            if first_error is None:
+                first_error = e
+            # 鉴权类错误不重试; 瞬时类重试一次(换降级查询)
+            if not _transient_search_error(e):
+                break
+            continue
+        if results:
+            if attempt == 1:
+                log("search retry succeeded: %d results" % len(results))
+            break
+        log("search attempt %d: 0 results" % (attempt + 1))
     ctx()["search_ms"] = (time.monotonic() - started) * 1000
+    if not results:
+        if first_error is not None:
+            return SEARCH_REPLIES["search_api_error"], "search_api_error"
+        return SEARCH_REPLIES["search_no_results"], "search_no_results"
     audit_search_sources(ctx()["rid"], question, results)
     days = web_search.fresh_window(question)  # 行情类14天(周末休市), 其他7天
     fresh = web_search.filter_fresh(results, days=days)
     log("search: %d results, %d fresh (%dd)" % (len(results), len(fresh), days))
     if not fresh:
-        # 结果全旧/无日期: 不拿旧数据冒充最新, 诚实告知
-        return SEARCH_STALE_REPLY, "search_stale"
+        # 有结果但全旧: 不拿旧数据冒充最新, 诚实告知
+        return SEARCH_REPLIES["search_stale"], "search_stale"
     context, _sources = web_search.build_context(question, fresh)
     try:
-        reply = glm_answer(context, system=SEARCH_SYSTEM)
+        # 搜索已付费拿到数据, 对GLM空回答多一次重试(共3次尝试)
+        reply = glm_answer(context, system=SEARCH_SYSTEM, retries=2)
         return reply, "search+glm"
     except glm_provider.ProviderError as e:
         log("GLM error after search: %s" % e)
-        return SEARCH_STALE_REPLY, "search_error"
+        return SEARCH_REPLIES["model_error"], "model_error"
 
 
 def _mcp_op(fn, *args):
@@ -488,7 +526,8 @@ class Handler(BaseHTTPRequestHandler):
         METRICS["lat_ms"].append(ms)
         METRICS["intents"][intent] = METRICS["intents"].get(intent, 0) + 1
         # 业务层成败: 降级(记忆/搜索不可用)与失败分开统计, 不虚报成功率
-        if provider in ("error", "search_error", "search_stale"):
+        if provider in ("error", "search_api_error", "search_no_results",
+                        "search_stale", "model_error"):
             METRICS["answers_failed"] += 1
         elif provider in ("degraded", "demo"):
             METRICS["answers_degraded"] += 1

@@ -198,7 +198,7 @@ class TestCreateDedupe(unittest.TestCase):
 
 
 class TestRealtimeHandlerFallback(unittest.TestCase):
-    def test_search_failure_is_honest(self):
+    def test_search_api_error_distinct(self):
         import server
 
         def boom(query, **kw):
@@ -209,8 +209,21 @@ class TestRealtimeHandlerFallback(unittest.TestCase):
         server.GLM_KEY = "k"
         try:
             reply, provider = server.handle_realtime("现在美元汇率多少")
-            self.assertIn("没拿到可靠的最新数据", reply)
-            self.assertEqual(provider, "search_error")
+            self.assertIn("联网搜索服务", reply)
+            self.assertEqual(provider, "search_api_error")
+        finally:
+            web_search.search = orig
+
+    def test_no_results_after_retry_distinct(self):
+        import server
+        calls = []
+        orig = web_search.search
+        web_search.search = lambda query, **kw: calls.append(query) or []
+        try:
+            reply, provider = server.handle_realtime("某个生僻实时话题")
+            self.assertIn("没搜到相关内容", reply)
+            self.assertEqual(provider, "search_no_results")
+            self.assertEqual(len(calls), 2)  # 带锚点一次 + 去锚点重试一次
         finally:
             web_search.search = orig
 
@@ -222,10 +235,91 @@ class TestRealtimeHandlerFallback(unittest.TestCase):
         web_search.search = lambda query, **kw: stale
         try:
             reply, provider = server.handle_realtime("现在美元汇率多少")
-            self.assertIn("没拿到可靠的最新数据", reply)
+            self.assertIn("不是最近的数据", reply)
             self.assertEqual(provider, "search_stale")
         finally:
             web_search.search = orig
+
+    def test_transient_timeout_retried_once(self):
+        """首次搜索瞬时超时: 用降级查询重试, 成功后正常走回答链路."""
+        import glm_provider
+        import server
+        fresh = [{"publish_date": "2026-10-24", "title": "t", "content": "c",
+                  "media": "m", "link": "l"}]
+        calls = []
+
+        def flaky(query, **kw):
+            calls.append(query)
+            if len(calls) == 1:
+                raise web_search.SearchError("搜索服务超时或网络异常")
+            return fresh
+
+        orig_search, orig_glm = web_search.search, server.glm_answer
+        web_search.search = flaky
+        server.glm_answer = lambda prompt, system=None, retries=1: "搜到的回答"
+        try:
+            reply, provider = server.handle_realtime("现在美元汇率多少")
+            self.assertEqual(reply, "搜到的回答")
+            self.assertEqual(provider, "search+glm")
+            self.assertEqual(len(calls), 2)
+        finally:
+            web_search.search = orig_search
+            server.glm_answer = orig_glm
+
+    def test_auth_error_not_retried(self):
+        """鉴权类错误重试无意义: 只调一次."""
+        import server
+        calls = []
+
+        def denied(query, **kw):
+            calls.append(query)
+            raise web_search.SearchError("搜索服务返回HTTP 401")
+
+        orig = web_search.search
+        web_search.search = denied
+        try:
+            reply, provider = server.handle_realtime("现在美元汇率多少")
+            self.assertEqual(provider, "search_api_error")
+            self.assertEqual(len(calls), 1)
+        finally:
+            web_search.search = orig
+
+    def test_model_error_after_good_search(self):
+        """搜索拿到新鲜数据但GLM连续失败: 不得再说'没拿到数据'."""
+        import glm_provider
+        import server
+        fresh = [{"publish_date": "2026-10-24", "title": "t", "content": "c",
+                  "media": "m", "link": "l"}]
+        orig_search, orig_glm = web_search.search, server.glm_answer
+        web_search.search = lambda query, **kw: fresh
+        server.glm_answer = lambda prompt, system=None, retries=1: (
+            (_ for _ in ()).throw(glm_provider.ProviderError("GLM返回了空回答")))
+        try:
+            reply, provider = server.handle_realtime("现在美元汇率多少")
+            self.assertIn("组织回答", reply)
+            self.assertEqual(provider, "model_error")
+        finally:
+            web_search.search = orig_search
+            server.glm_answer = orig_glm
+
+
+class TestOptimizeQuery(unittest.TestCase):
+    def test_filler_stripped_and_date_anchored(self):
+        from datetime import date
+        q = web_search.optimize_query("贾维斯，今天有什么重要的AI新闻",
+                                      today=date(2026, 10, 25))
+        self.assertNotIn("贾维斯", q)
+        self.assertNotIn("今天", q)
+        self.assertNotIn("有", q)
+        self.assertTrue(q.endswith("2026年10月"))
+        self.assertIn("AI", q)
+
+    def test_finance_terms_kept(self):
+        from datetime import date
+        q = web_search.optimize_query("离岸人民币现在是在升值还是贬值",
+                                      today=date(2026, 10, 25))
+        for term in ("离岸人民币", "升值", "贬值"):
+            self.assertIn(term, q)
 
 
 if __name__ == "__main__":

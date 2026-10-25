@@ -22,7 +22,7 @@ DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DEFAULT_ENGINE = "search_pro"
 DEFAULT_COUNT = 6
-DEFAULT_TIMEOUT = 12.0
+DEFAULT_TIMEOUT = 10.0  # 典型2-3s; 上限压住, 给上层重试留时间预算
 
 # 触发联网的时效/实时词 (问的是"现在的状态"而非"概念")
 _TIME_RE = re.compile(
@@ -68,7 +68,7 @@ def need_search(question):
 # 口语填充词: 进搜索框前去掉, 否则引擎被带偏 (实测对比明显)
 _FILLER_RE = re.compile(
     r"贾维斯|jarvis|请问|帮我|麻烦|一下|现在|目前|当前|今天|今日|最新|最近|实时"
-    r"|是在|还是|了|呢|吗|啊|吧|么|什么|怎么|有没有|告诉我|多少"
+    r"|是在|还是|了|呢|吗|啊|吧|么|什么|怎么|有没有|告诉我|多少|的|有|是"
     r"|[，。？！,?!\\s]+",
     re.IGNORECASE,
 )
@@ -160,13 +160,17 @@ def search(query, count=DEFAULT_COUNT, engine=DEFAULT_ENGINE,
     return out
 
 
-def build_context(question, results, today=None):
-    """把新鲜结果整理成给模型的上下文(带日期来源), 以及审计用的来源清单."""
+def build_context(question, results, today=None, max_results=4, snippet_chars=160):
+    """把新鲜结果整理成给模型的上下文(带日期来源), 以及审计用的来源清单.
+
+    v0.3.1: 结果条数与摘要长度收紧 — 实测上下文越大, GLM空回答率越高
+    且更慢; 取前4条、每条160字已足够支撑简短口语回答.
+    """
     today = today or date.today()
     lines = []
     sources = []
-    for i, r in enumerate(results, 1):
-        snippet = re.sub(r"\s+", " ", r["content"])[:220]
+    for i, r in enumerate(results[:max_results], 1):
+        snippet = re.sub(r"\s+", " ", r["content"])[:snippet_chars]
         lines.append("[{i}] 日期:{d} 来源:{m}\n{t}\n{s}".format(
             i=i, d=r["publish_date"] or "无日期", m=r["media"] or "未知",
             t=r["title"][:60], s=snippet))
